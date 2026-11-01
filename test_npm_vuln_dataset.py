@@ -1,4 +1,3 @@
-"""Offline tests, including fake public API responses. Run: python -m unittest -v test_npm_vuln_dataset.py"""
 import csv
 import tempfile
 import unittest
