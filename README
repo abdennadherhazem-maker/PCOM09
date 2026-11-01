@@ -1,6 +1,4 @@
 Apis Documentation
-
-* npm registry: https://registry.npmjs.org/
 * npm download counts: https://github.com/npm/registry/blob/main/docs/download-counts.md
 * GitHub reviewed advisories: https://docs.github.com/en/rest/security-advisories/global-advisories
 * GitHub issues: https://docs.github.com/en/rest/issues/issues
