@@ -42,6 +42,15 @@ def identity(value):
     return name, ver
 
 
+def csv_identity(row, training=False):
+    value = (row.get('purl') or '').strip()
+    if value or training:
+        return identity(value)
+    name = row.get('package') or row.get('package_name') or row.get('name') or ''
+    version = row.get('version') or row.get('package_version') or ''
+    return name.strip() or None, version.strip() or None
+
+
 def infer_csv_cutoff(groups):
     candidates = None
     for package, rows in groups.items():
@@ -71,24 +80,31 @@ def csv_sample(pkg, rows, cutoff, training):
     creation = instant(rows[0]['package_created_at'])
     labels = None
     for row in rows:
-        name, ver = identity(row['purl'])
-        rank = stable(ver)
+        name, ver = csv_identity(row, training)
+        rank = stable(ver) if ver is not None else None
         published = instant(row['published_at'])
-        if (name != pkg or ver in seen or rank is None or instant(row['package_created_at']) != creation
+        if ((name is not None and name != pkg) or (ver is not None and (ver in seen or rank is None))
+                or instant(row['package_created_at']) != creation
                 or not (creation <= published and start <= published < cutoff)):
             raise ValueError(
-                f'Invalid package, duplicate, prerelease, or out-of-window release: {row["purl"]}')
-        seen.add(ver)
-        release_rows.append((published, ver, rank, row))
+                f'Invalid package, duplicate, prerelease, or out-of-window release: {pkg}, {ver}, {row["published_at"]}')
+        if ver is not None:
+            seen.add(ver)
+        release_rows.append((published, ver or '', rank, row))
         if training:
             values = tuple(numeric(row, field, required=True) for field in TARGETS)
             if labels is not None and labels != values:
                 raise ValueError(f'Conflicting package targets for {pkg}')
             labels = values
+    highest = rows[-1]
+    if len(seen) < len(rows):
+        known_ranks = [r[2] for r in release_rows if r[2] is not None]
+        if known_ranks != sorted(known_ranks):
+            raise ValueError(f'For {pkg}, provide a version for every row or keep rows in ascending semantic-version order.')
     release_rows.sort(key=lambda r: (r[0], r[1]))
+    if len(seen) == len(rows):
+        highest = max(release_rows, key=lambda r: r[2])[3]
     rows = [r[3] for r in release_rows]
-    top = max(r[2] for r in release_rows)
-    highest = next(r[3] for r in release_rows if r[2] == top)
     first, last = release_rows[0][0], release_rows[-1][0]
     features = [len(rows), (cutoff-creation).total_seconds()/86400, (last-first).total_seconds()/86400,
                 (cutoff-last).total_seconds()/86400]
@@ -160,17 +176,23 @@ def load_samples(paths, manifests, training=True, package=None, anchor=None, csv
         groups = defaultdict(list)
         with path.open(newline='', encoding='utf-8-sig') as fh:
             reader = csv.DictReader(fh)
-            required = {'purl', 'package_created_at', 'published_at', *BASE, *CSV_HISTORY}
+            required = {'package_created_at', 'published_at', *BASE, *CSV_HISTORY}
             required.update(f'{m}_M{i}' for m in (*CSV_HISTORY, *MONTHLY) for i in range(12))
             if training:
+                required.add('purl')
                 required.update(TARGETS)
             missing = required - set(reader.fieldnames or [])
             if missing:
                 raise ValueError(f'{path} lacks columns: {sorted(missing)}')
             for row in reader:
-                name, _ = identity(row['purl'])
-                if package is None or package == name:
-                    groups[name].append(row)
+                name, _ = csv_identity(row, training)
+                groups[name].append(row)
+        if None in groups:
+            if len(groups) > 1:
+                raise ValueError(f'{path} mixes named and anonymous rows. Supply a package name for each row.')
+            groups[package or path.stem] = groups.pop(None)
+        if package is not None:
+            groups = {package: groups[package]} if package in groups else {}
         if not groups:
             continue
         if t is None:
@@ -227,13 +249,13 @@ def expected_counts(model, X):
     return values
 
 
-def predict_tuple(model, rows, *, cutoff=None, expected=False):
+def predict_tuple(model, rows, *, cutoff=None, expected=True):
     if model['data_format'] == RELEASE_FORMAT:
         x = encode(rows)
     else:
         if not rows:
             raise ValueError('CSV prediction requires package version rows')
-        name, _ = identity(rows[0]['purl'])
+        name = next((name for row in rows if (name := csv_identity(row)[0])), 'package')
         t = instant(cutoff) if isinstance(cutoff, str) else cutoff
         if t is None:
             t = infer_csv_cutoff({name: rows})
@@ -349,7 +371,8 @@ def main(argv=None):
             cli.add_argument('--output', type=Path, help='Prediction CSV. Defaults to <input>_predictions.csv beside the first input.')
             cli.add_argument('--package', help='Optional exact package name. Defaults to all packages in the input.')
             cli.add_argument('--prediction-at', help='UTC prediction time if the input has several cohorts')
-            cli.add_argument('--expected', action='store_true')
+            cli.add_argument('--expected', action=argparse.BooleanOptionalAction, default=True,
+                             help='Write floating-point expected counts (default). Use --no-expected for rounded counts.')
         else:
             cli.add_argument('--report', type=Path, default=SCRIPT_DIR/'npm_evaluation.json')
     arguments = sys.argv[1:] if argv is None else argv
@@ -365,8 +388,6 @@ def main(argv=None):
             and args.data[0].stem in TRAINING_CSV_STEMS
             and args.data[0].suffix.lower() in ('', '.csv')):
         args.csv_cutoff = DEFAULT_CUTOFF
-    if args.action == 'train' and args.csv_cutoff:
-        print(f'Reading {args.data[0]} with a 90-day target starting {args.csv_cutoff} UTC.', flush=True)
     is_train = args.action != 'predict'
     anchor = split_time(args.prediction_at) if getattr(args, 'prediction_at', None) else None
     kind, samples = load_samples(args.data, args.manifest, is_train, getattr(args, 'package', None),
@@ -408,7 +429,7 @@ def main(argv=None):
                 tmp_path.unlink(missing_ok=True)
                 raise
         os.replace(tmp_path, args.model)
-        print(f'Saved four LightGBM Poisson regressors trained on {len(training)} package windows to {args.model}.')
+        print('trained')
         return 0
     test = [s for s in samples if s.y is not None and s.t >= split]
     if not test:
