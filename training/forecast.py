@@ -1,4 +1,4 @@
-"""Fit, predict and evaluate four 90-day package-level GHSA publication counts."""
+"""Fit, predict and evaluate five 90-day package-level GHSA publication counts."""
 from __future__ import annotations
 
 import argparse
@@ -182,6 +182,8 @@ def fit(samples, alpha=1.0):
         raise ValueError('alpha must be finite and positive')
     X = np.stack([s.x for s in samples])
     Y = np.stack([s.y for s in samples])
+    if Y.shape != (len(samples), len(BANDS)) or not np.isfinite(Y).all() or (Y < 0).any():
+        raise ValueError(f'Training requires {len(BANDS)} finite nonnegative targets per window: {BANDS}')
     medians = np.array([np.median(col[np.isfinite(col)]) if np.any(np.isfinite(col)) else 0 for col in X.T])
     filled = np.where(np.isnan(X), medians, X)
     center, scale = filled.mean(axis=0), filled.std(axis=0)
@@ -202,7 +204,7 @@ def fit(samples, alpha=1.0):
 
 def rates(model, X):
     if model.get('format') != FORMAT or model.get('columns') != COLUMNS or model.get('bands') != list(BANDS):
-        raise ValueError('Incompatible forecast model or feature definition')
+        raise ValueError('Incompatible forecast model or feature definition. Retrain for five severities, including unknown.')
     Z = design(np.atleast_2d(X), np.array(model['medians']),
                np.array(model['center']), np.array(model['scale']))
     means = []
@@ -214,13 +216,13 @@ def rates(model, X):
         if not np.all(np.isfinite(mu)) or np.any(mu < 0):
             raise ValueError('Model produced an invalid count forecast')
         means.append(mu)
-    if len(means) != 4:
-        raise ValueError('Model must have four severity heads')
+    if len(means) != len(BANDS):
+        raise ValueError(f'Model must have {len(BANDS)} severity heads')
     return np.column_stack(means)
 
 
-def predict(model, rows, *, expected=False):
-    """Return four whole counts, or their unrounded expectations with expected=True."""
+def predict(model, rows, *, expected=True):
+    """Return five floats in BANDS order; expected=False opts into rounded counts."""
     x = encode(rows)
     if instant(model['train_labels_through']) > instant(rows[0]['prediction_at']):
         raise ValueError('Train an earlier model. This model uses outcomes later than the selected release.')
@@ -262,8 +264,8 @@ def main(argv=None):
                       help='JSONL examples; use --package when multiple packages are present')
     pred.add_argument('--package')
     pred.add_argument('--prediction-at', help='Disambiguate one release anchor')
-    pred.add_argument('--expected', action='store_true',
-                      help='Return unrounded expected counts in place of whole-count point estimates')
+    pred.add_argument('--expected', action=argparse.BooleanOptionalAction, default=True,
+                      help='Return floating-point expected counts (default). Use --no-expected for rounded counts.')
     args = ap.parse_args(argv)
     if args.action == 'predict':
         model = json.loads(args.model.read_text())
@@ -299,7 +301,7 @@ def main(argv=None):
             json.dump(model, f, allow_nan=False)
             tmp = Path(f.name)
         tmp.replace(args.model)
-        print(f"Trained four severity heads on {len(train_set)} package windows.")
+        print(f"Trained {len(BANDS)} severity heads on {len(train_set)} package windows.")
         return 0
     stop = split_time(args.until) if args.until else None
     test_set = [s for s in samples if s.y is not None and s.t >= split and (stop is None or s.t < stop)]

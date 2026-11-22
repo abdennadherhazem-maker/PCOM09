@@ -10,7 +10,7 @@ from urllib.parse import quote
 from semantic_version import Version
 
 UTC = timezone.utc
-BANDS = ('low', 'moderate', 'high', 'critical')
+BANDS = ('low', 'moderate', 'high', 'critical', 'unknown')
 HORIZON = timedelta(days=90)
 FORMAT = 'npm-release-counts/1'
 BASE = ('unpacked_size', 'file_count', 'dependency_count', 'optional_dependency_count',
@@ -20,9 +20,9 @@ REPO_METRICS = ('issues_opened', 'issues_closed', 'issues_reopened', 'pull_reque
                 'issues_open_at_month_end', 'pull_requests_open_at_month_end')
 MONTHLY = ('package_downloads', 'package_download_days_observed',
            'package_stable_release_count', *REPO_METRICS)
-GHSA = tuple(f'ghsa_{s}_count' for s in (*BANDS, 'unknown', 'none'))
+GHSA = tuple(f'ghsa_{s}_count' for s in (*BANDS, 'none'))
 TARGETS = tuple(f'target_ghsa_{s}_count_90d' for s in BANDS)
-AUDIT = ('target_ghsa_unknown_count_90d', 'target_ghsa_none_count_90d')
+AUDIT = ('target_ghsa_none_count_90d',)
 
 
 def instant(value: str) -> datetime:
@@ -171,7 +171,7 @@ def advisory_features(w, release, history):
                 monthly[s, i] += 1
                 break
     row = {}
-    for s in (*BANDS, 'unknown', 'none'):
+    for s in (*BANDS, 'none'):
         row[f'ghsa_{s}_count'] = totals[s]
         for i, (a, _) in enumerate(w.months):
             row[f'ghsa_{s}_count_M{i}'] = monthly[s, i] if a <= w.anchor.time else None
@@ -184,4 +184,4 @@ def outcome(w, advisories):
     for ghsa in advisories:
         if w.anchor.time <= ghsa.published < w.anchor.time + HORIZON:
             counts[band(ghsa.severity, ghsa.entries)] += 1
-    return {f'target_ghsa_{s}_count_90d': counts[s] for s in (*BANDS, 'unknown', 'none')}
+    return {f'target_ghsa_{s}_count_90d': counts[s] for s in (*BANDS, 'none')}

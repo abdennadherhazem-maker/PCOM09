@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+data
+outputs
+**/__pycache__
+*.pem
+*.key
+.env
+.env.*
+*.log

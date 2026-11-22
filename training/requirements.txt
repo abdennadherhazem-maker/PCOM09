@@ -1,3 +1,4 @@
+# Model dependencies
 semantic-version==2.10.0
 cvss==3.6
 httpx[socks]>=0.27,<1
@@ -5,3 +6,9 @@ numpy>=1.24,<3
 scikit-learn>=1.3,<2
 threadpoolctl>=3.1,<4
 lightgbm==4.6.0
+
+# Professor's HTTP API and CSV handling
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pandas>=2,<4
+requests>=2.31,<3

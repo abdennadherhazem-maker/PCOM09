@@ -19,7 +19,7 @@ from sklearn.model_selection import KFold
 from core import BASE, BANDS, GHSA, HORIZON, MONTHLY, TARGETS, UTC, calendar_end, instant, iso, shift_month, stable
 from forecast import COLUMNS, Sample, encode, metrics, numeric, read, split_time
 
-MODEL_FORMAT = 'lightgbm-npm-poisson/1'
+MODEL_FORMAT = 'lightgbm-npm-poisson/2'
 CSV_FORMAT = 'calendar-cutoff-csv'
 RELEASE_FORMAT = 'release-anchor-jsonl'
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -208,9 +208,9 @@ def load_samples(paths, manifests, training=True, package=None, anchor=None, csv
 
 
 def fit_severity(X, y, columns):
-    reg = lgb.LGBMRegressor(objective='poisson', n_estimators=150, learning_rate=0.04,
+    reg = lgb.LGBMRegressor(objective='poisson', n_estimators=150, learning_rate=0.07,
                             num_leaves=15, min_child_samples=10, reg_lambda=2.0,
-                            random_state=42, n_jobs=1, verbosity=-1)
+                            random_state=45, n_jobs=1, verbosity=-1)
     reg.fit(X, y, feature_name=columns)
     return reg.booster_
 
@@ -221,15 +221,17 @@ def fit(samples, kind):
     X = np.stack([s.x for s in samples])
     Y = np.stack([s.y for s in samples])
     columns = COLUMNS if kind == RELEASE_FORMAT else CSV_NAMES
-    missing_events = [band for j, band in enumerate(BANDS) if not np.any(Y[:, j])]
-    if missing_events:
-        raise ValueError('All training labels are zero for ' + ', '.join(missing_events) +
-                         '. Add historical windows with observed events in those bands to fit four Poisson regressors.')
+    if Y.shape != (len(samples), len(BANDS)) or not np.isfinite(Y).all() or (Y < 0).any():
+        raise ValueError(f'Training requires {len(BANDS)} finite nonnegative targets per window: {BANDS}')
     if len(samples) < 2:
         raise ValueError('LightGBM needs at least two package windows. Each package history is one example.')
     heads = {}
     for j, severity in enumerate(BANDS):
-        heads[severity] = fit_severity(X, Y[:, j], columns).model_to_string()
+        # A Poisson booster cannot fit an all-zero response. Record the fitted
+        # zero baseline explicitly for that target; positive labels use LightGBM.
+        y = Y[:, j]
+        heads[severity] = (fit_severity(X, y, columns).model_to_string()
+                           if np.any(y) else {'constant': 0.0})
     return dict(format=MODEL_FORMAT, data_format=kind, order=list(BANDS), feature_names=columns,
                 version=lgb.__version__, train_through=iso(max(s.end for s in samples)),
                 training_windows=len(samples), training_mean=Y.mean(axis=0).tolist(), heads=heads)
@@ -238,11 +240,20 @@ def fit(samples, kind):
 def expected_counts(model, X):
     columns = COLUMNS if model['data_format'] == RELEASE_FORMAT else CSV_NAMES
     if model.get('format') != MODEL_FORMAT or model['order'] != list(BANDS) or model['feature_names'] != columns:
-        raise ValueError('Incompatible model or feature schema')
+        raise ValueError('Incompatible model or feature schema. Retrain for five severities, including unknown.')
+    if set(model.get('heads', {})) != set(BANDS):
+        raise ValueError(f'Model must contain exactly these severity heads: {BANDS}')
+    X = np.atleast_2d(X)
     preds = []
     for band in BANDS:
-        booster = lgb.Booster(model_str=model['heads'][band])
-        preds.append(booster.predict(np.atleast_2d(X), num_threads=1))
+        head = model['heads'][band]
+        if isinstance(head, dict) and set(head) == {'constant'}:
+            preds.append(np.full(X.shape[0], float(head['constant']), dtype=float))
+        elif isinstance(head, str):
+            booster = lgb.Booster(model_str=head)
+            preds.append(booster.predict(X, num_threads=1))
+        else:
+            raise ValueError(f'Invalid model head for {band}')
     values = np.column_stack(preds)
     if not np.isfinite(values).all() or (values < 0).any():
         raise ValueError('Invalid predicted mean')
@@ -264,6 +275,8 @@ def predict_tuple(model, rows, *, cutoff=None, expected=True):
 
 
 def count_tuple(means, expected):
+    if len(means) != len(BANDS):
+        raise ValueError(f'Expected {len(BANDS)} severity counts, got {len(means)}')
     return tuple(float(v) for v in means) if expected else tuple(math.floor(v+0.5) for v in means)
 
 
@@ -305,6 +318,7 @@ def evaluate_packages(samples, kind):
             y = Y[train, j]
             if not np.any(y):
                 missing_folds[band].append(fold)
+                predictions[test, j] = 0.0
                 continue
             booster = fit_severity(X[train], y, columns)
             predictions[test, j] = booster.predict(X[test], num_threads=1)
@@ -322,8 +336,6 @@ def evaluate_packages(samples, kind):
             'model': None,
             'folds_without_training_events': missing_folds[band],
         }
-        if missing_folds[band]:
-            continue
         mu = predictions[:, j]
         if not np.isfinite(mu).all() or (mu < 0).any():
             raise ValueError(f'Invalid held-out predictions for {band}')
@@ -349,7 +361,7 @@ def print_evaluation(report):
               f"{display(model.get('mean_poisson_deviance', 'n/a')):>10}  "
               f"{display(mean['mean_poisson_deviance']):>9}")
         if row['folds_without_training_events']:
-            print(f"  {band}: at least one fold had zero training events. Full model score unavailable.")
+            print(f"  {band}: a constant-zero predictor was used in folds with no training events.")
     print('Lower MAE and Poisson deviance are better. MAE is the average absolute error in counts per package window.')
 
 
