@@ -1,3 +1,9 @@
+"""Construct npm version records with version-level historical GHSA features.
+
+The 90-day target GHSA counts remain package-level by design: one four-tuple
+(low/moderate/high/critical) is predicted per package, not per input version.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,13 +15,14 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from semantic_version import Version
+from semantic_version import NpmSpec, Version
 from urllib3.util.retry import Retry
 
 LOG = logging.getLogger("npm-vulnerability-dataset")
@@ -44,6 +51,10 @@ GENERAL_FIELDS = (
 TARGET_FIELDS = tuple(f"target_ghsa_{s}_count_90d" for s in SEVERITIES)
 CUTOFF_DEFAULT = "2026-07-01"
 DEFAULT_PACKAGES_FILE = Path(__file__).resolve().with_name("packages.text")
+if not DEFAULT_PACKAGES_FILE.is_file():
+    attached_list = DEFAULT_PACKAGES_FILE.with_name("packages(1).text")
+    if attached_list.is_file():
+        DEFAULT_PACKAGES_FILE = attached_list
 
 
 def dt(value: str) -> datetime:
@@ -160,18 +171,23 @@ class IncompletePagination(RuntimeError):
     pass
 
 
+def http_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "npm-ghsa-training-dataset/1.0"})
+    retry = Retry(total=4, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
+                  respect_retry_after_header=True)
+    session.mount("https://", HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=retry))
+    return session
+
+
 class Http:
     def __init__(self, cache_dir: Path, token: str | None = None):
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "npm-ghsa-training-dataset/1.0",
-                                     "Accept": "application/vnd.github+json"})
+        self.session = http_session()
+        self.github_headers = {"Accept": "application/vnd.github+json"}
         if token:
-            self.session.headers["Authorization"] = f"Bearer {token}"
-        retry = Retry(total=4, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
-                      respect_retry_after_header=True)
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+            self.github_headers["Authorization"] = f"Bearer {token}"
 
     def get(self, url: str, params: dict | None = None) -> tuple[object, str | None]:
         # Cache data AND the  URL
@@ -181,7 +197,9 @@ class Http:
         if cached.exists():
             obj = json.loads(cached.read_text(encoding="utf-8"))
             return obj["data"], obj["next"]
-        response = self.session.get(url, params=params, timeout=40)
+        dest = urlparse(url)
+        headers = self.github_headers if (dest.scheme, dest.netloc) == ("https", "api.github.com") else {}
+        response = self.session.get(url, params=params, headers=headers, timeout=40)
         response.raise_for_status()
         result = response.json()
         nxt = response.links.get("next", {}).get("url")
@@ -256,32 +274,40 @@ def release_fields(versions: list[tuple], months: list[tuple]) -> dict:
 
 
 def download_fields(http: Http, package: str, months: list[tuple]) -> dict:
-    result = {}
-    for i, (start, end) in enumerate(months):
-        days_end = (end - timedelta(days=1)).date()
-        url = (f"https://api.npmjs.org/downloads/range/"
-               f"{start.date().isoformat()}:{days_end.isoformat()}/"
-               f"{quote(package, safe='@')}")
-        try:
-            payload, _ = http.get(url)
-            if not isinstance(payload, dict) or not isinstance(payload.get("downloads"), list):
-                raise ValueError("No daily downloads array")
-            observed = {}
-            for item in payload["downloads"]:
-                try:
-                    day = date.fromisoformat(item["day"])
-                    count = nonnegative_int(item["downloads"])
-                    if start.date() <= day < end.date() and count is not None:
-                        observed[day] = count
-                except (KeyError, ValueError, TypeError):
-                    continue
-            result[f"package_downloads_M{i}"] = sum(observed.values())
-            result[f"package_download_days_observed_M{i}"] = len(observed)
-        except (requests.RequestException, ValueError) as error:
-            LOG.warning("Downloads unavailable for %s M%d (%s)", package, i, error)
-            result[f"package_downloads_M{i}"] = None
-            result[f"package_download_days_observed_M{i}"] = None
-    return result
+    overall_start = months[-1][0].date()
+    overall_end = (months[0][1] - timedelta(days=1)).date()
+    url = (f"https://api.npmjs.org/downloads/range/"
+           f"{overall_start.isoformat()}:{overall_end.isoformat()}/"
+           f"{quote(package, safe='@')}")
+    try:
+        payload, _ = http.get(url)
+        downloads = payload.get("downloads") if isinstance(payload, dict) else None
+        if not isinstance(downloads, list):
+            raise ValueError("No daily downloads array")
+        
+        by_day = {}
+        for item in downloads:
+            try:
+                day = date.fromisoformat(item["day"])
+                count = nonnegative_int(item["downloads"])
+                if count is not None:
+                    by_day[day] = count
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        result = {}
+        for i, (start, end) in enumerate(months):
+            s_date, e_date = start.date(), end.date()
+            month_counts = [c for d, c in by_day.items() if s_date <= d < e_date]
+            result[f"package_downloads_M{i}"] = sum(month_counts) if month_counts else 0
+            result[f"package_download_days_observed_M{i}"] = len(month_counts)
+        return result
+    except (requests.RequestException, ValueError) as error:
+        LOG.warning("Downloads unavailable for %s (%s)", package, error)
+        return {
+            **{f"package_downloads_M{i}": None for i in range(12)},
+            **{f"package_download_days_observed_M{i}": None for i in range(12)},
+        }
 
 
 def severity(value) -> str:
@@ -318,42 +344,101 @@ def retrieve_advisories(http: Http, pkg: str, outcome_end: datetime, max_pages: 
     return http.pages(url, params, max_pages)
 
 
-def ghsa_fields(advisories: list[dict], pkg: str, cutoff: datetime,
-                months: list[tuple], end: datetime) -> dict:
-    # Deduplicate GHSA IDs
+def advisory_affects_version(advisory: dict, package: str, version: str) -> bool:
+    """Whether an advisory explicitly affects one *exact* published npm version.
+
+    GitHub returns NPM-style vulnerable_version_range values such as
+    ">= 1.0.0, < 2.0.0". Normalize comparator spacing for semantic_version.NpmSpec.
+    An unknown/malformed applicable range is NOT interpreted as "not affected":
+    raise an error to prevent producing a false zero feature.
+    """
+    try:
+        parsed_version = Version(version[1:] if version.startswith("v") else version)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid npm version for GHSA matching: {version!r}") from exc
+
+    unresolved = []
+    for vulnerability in advisory.get("vulnerabilities") or []:
+        if not isinstance(vulnerability, dict):
+            continue
+        pkg = vulnerability.get("package") or {}
+        if (pkg.get("ecosystem") != "npm" or pkg.get("name") != package):
+            continue
+
+        raw_range = vulnerability.get("vulnerable_version_range")
+        if not isinstance(raw_range, str) or not raw_range.strip():
+            unresolved.append("missing vulnerable_version_range")
+            continue
+
+        # GitHub ranges use comma-separated, spaced comparators; NpmSpec uses
+        # whitespace-separated comparator expressions (preserving any `||`).
+        normalized = re.sub(r"\s*,\s*", " ", raw_range.strip())
+        normalized = re.sub(r"(<=|>=|<|>|=|~|\^)\s+(?=[vV]?\d)", r"\1", normalized)
+        try:
+            if NpmSpec(normalized).match(parsed_version):
+                return True
+        except (ValueError, TypeError) as exc:
+            unresolved.append(f"invalid range {raw_range!r}: {exc}")
+
+    if unresolved:
+        raise ValueError(
+            f"Cannot establish whether GHSA {advisory.get('ghsa_id')} affects "
+            f"{package}@{version}: {'; '.join(unresolved)}"
+        )
+    return False
+
+
+def historical_ghsa_fields(advisories: list[dict], pkg: str, version: str,
+                           cutoff: datetime, months: list[tuple]) -> dict:
+    """Lifetime and M0..M11 GHSA *features*, specific to the record version."""
     previous = Counter()
     monthly = Counter()
-    targets = Counter()
     seen = set()
     for item in advisories:
         ghsa = item.get("ghsa_id")
-        if not ghsa or ghsa in seen or item.get("type") != "reviewed":
+        if not ghsa or ghsa in seen or not advisory_qualifies(item, pkg, cutoff):
             continue
-        try:
-            published = dt(item["published_at"])
-        except (ValueError, KeyError):
-            continue
-        if published >= end:
-            continue
-  
-        as_of = cutoff if published < cutoff else end
-        if not advisory_qualifies(item, pkg, as_of):
+        if not advisory_affects_version(item, pkg, version):
             continue
         seen.add(ghsa)
         s = severity(item.get("severity"))
-        if published < cutoff:
-            previous[s] += 1
-            i = month_index(published, months)
-            if i is not None:
-                monthly[(s, i)] += 1
-        else:
-            targets[s] += 1
+        previous[s] += 1
+        i = month_index(dt(item["published_at"]), months)
+        if i is not None:
+            monthly[(s, i)] += 1
+
     result = {f"ghsa_{s}_count": previous[s] for s in SEVERITIES}
     for s in SEVERITIES:
         for i in range(12):
             result[f"ghsa_{s}_count_M{i}"] = monthly[(s, i)]
-        result[f"target_ghsa_{s}_count_90d"] = targets[s]
     return result
+
+
+def package_target_ghsa_fields(advisories: list[dict], pkg: str,
+                               cutoff: datetime, end: datetime) -> dict:
+    """Future 90-day package-level targets; same for every version input row.
+
+    The professor's model predicts a four-tuple for the *package* rather than
+    independent four-tuples for each input version. Retain the fifth unknown
+    target in the schema even though it is not in the model's four-tuple.
+    """
+    targets = Counter()
+    seen = set()
+    for item in advisories:
+        ghsa = item.get("ghsa_id")
+        if not ghsa or ghsa in seen:
+            continue
+        try:
+            published = dt(item["published_at"])
+        except (KeyError, ValueError):
+            continue
+        if not cutoff <= published < end:
+            continue
+        if not advisory_qualifies(item, pkg, end):
+            continue
+        seen.add(ghsa)
+        targets[severity(item.get("severity"))] += 1
+    return {f"target_ghsa_{s}_count_90d": targets[s] for s in SEVERITIES}
 
 
 def github_activity_fields(http: Http, repo: str, months: list[tuple],
@@ -448,9 +533,11 @@ def github_activity_fields(http: Http, repo: str, months: list[tuple],
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("packages", nargs="*",
-                        help="Optional npm package names; if omitted, use packages.text next to this script")
+                        help=f"Optional exact names or quoted initials like 'A*'; default list: {DEFAULT_PACKAGES_FILE.name}")
     parser.add_argument("--packages-file",
-                        help="Use a different UTF-8 package list (overrides default packages.text)")
+                        help="Read package names and initials such as A* from this UTF-8 list")
+    parser.add_argument("--count-packages", action="store_true",
+                        help="Print the number of distinct selected names and exit before extraction")
     parser.add_argument("--output", default="npm_vulnerability_training.csv")
     parser.add_argument("--manifest", default="npm_vulnerability_manifest.json")
     parser.add_argument("--cutoff", default=CUTOFF_DEFAULT,
@@ -486,7 +573,8 @@ def build_package(http: Http, pkg: str, cutoff: datetime, months: list,
     common = release_fields(available, months)
     common.update(download_fields(http, pkg, months))
     advisory = retrieve_advisories(http, pkg, outcome_end, max_advisory_pages)
-    common.update(ghsa_fields(advisory, pkg, cutoff, months, outcome_end))
+    # Package-level future targets: one prediction label set per package.
+    common.update(package_target_ghsa_fields(advisory, pkg, cutoff, outcome_end))
 
     repo = repository_name(highest[3].get("repository"), packument.get("repository"),
                            highest[3].get("homepage"), packument.get("homepage"))
@@ -500,6 +588,8 @@ def build_package(http: Http, pkg: str, cutoff: datetime, months: list,
     for info in sorted(in_window, key=lambda x: (x[0], x[1])):
         row = version_fields(pkg, created, info)
         row.update(common)
+        # Historical GHSA inputs are version-specific, not common package data.
+        row.update(historical_ghsa_fields(advisory, pkg, info[1], cutoff, months))
         rows.append(row)
     return rows, {"status": "ok", "repo": repo,
                   "latest_stable_semver_as_of_cutoff": highest[1],
@@ -509,22 +599,65 @@ def build_package(http: Http, pkg: str, cutoff: datetime, months: list,
                      f"issues_opened_M0" in common)}
 
 
+def names_for_letter(letter: str) -> Iterator[str]:
+    """Page over both ASCII cases; npm's key ranges are case-sensitive."""
+    url = "https://replicate.npmjs.com/registry/_all_docs"
+    with http_session() as session:
+        for initial in (letter.upper(), letter.lower()):
+            start = initial
+            stop = chr(ord(initial) + 1)
+            last = None
+            while True:
+                params = {"startkey": json.dumps(start), "endkey": json.dumps(stop),
+                          "inclusive_end": "false", "limit": 10000}
+                response = session.get(url, params=params, timeout=60)
+                response.raise_for_status()
+                page = response.json()
+                rows = page.get("rows") if isinstance(page, dict) else None
+                if not isinstance(rows, list):
+                    raise ValueError(f"Registry returned an invalid page for {letter}*")
+                previous_last = last
+                for row in rows:
+                    name = row.get("id") if isinstance(row, dict) else None
+                    if not isinstance(name, str) or not name.startswith(initial) or (last is not None and name < last):
+                        raise ValueError(f"Unexpected registry key {name!r} while reading {letter}*")
+                    if name != last:
+                        last = name
+                        if not row.get("value", {}).get("deleted"):
+                            yield name
+                if last == previous_last:
+                    break
+                start = last  # startkey is inclusive, so the next page can repeat this name.
+
+
 def select_packages(names: list[str], packages_file: str | Path | None = None) -> list[str]:
- 
     packages = list(names)
     source = (Path(packages_file) if packages_file is not None else
               DEFAULT_PACKAGES_FILE if not packages else None)
     if source is not None:
         try:
-            lines = source.read_text(encoding="utf-8").splitlines()
+            lines = source.read_text(encoding="utf-8-sig").splitlines()
         except OSError as error:
             raise ValueError(f"Cannot read package list {source}: {error}") from error
         packages.extend(line.strip() for line in lines
                         if line.strip() and not line.lstrip().startswith("#"))
-    packages = list(dict.fromkeys(packages))
-    if not packages:
-        raise ValueError("No npm packages found. Add names to packages.text or supply package names.")
-    return packages
+    selected = {}
+    expanded = set()
+    for entry in packages:
+        if "*" not in entry:
+            selected[entry] = None
+            continue
+        if not re.fullmatch(r"[A-Za-z]\*", entry):
+            raise ValueError(f"Invalid package selector {entry!r}. Use one initial such as A*.")
+        letter = entry[0].lower()
+        if letter not in expanded:
+            LOG.info("Reading %s* package names from the npm registry", letter.upper())
+            for name in names_for_letter(letter):
+                selected[name] = None
+            expanded.add(letter)
+    if not selected:
+        raise ValueError("No npm packages found. Add a package name or an initial such as A* to the list.")
+    return list(selected)
 
 
 def main(argv=None) -> int:
@@ -541,8 +674,11 @@ def main(argv=None) -> int:
         raise SystemExit("Pagination page limits must be positive")
     try:
         packages = select_packages(args.packages, args.packages_file)
-    except ValueError as error:
+    except (ValueError, requests.RequestException) as error:
         raise SystemExit(str(error)) from error
+    if args.count_packages:
+        print(f"{len(packages):,} distinct npm package names selected")
+        return 0
     LOG.info("Selected %d npm packages (default list: %s)",
              len(packages), DEFAULT_PACKAGES_FILE.name)
     http = Http(Path(args.cache_dir), os.environ.get("GITHUB_TOKEN"))
@@ -557,28 +693,38 @@ def main(argv=None) -> int:
               "target_order_for_model": list(TARGET_FIELDS[:4]),
               "package_results": {}, "warnings": [
                   "GHSA REST API yields present-day severity/package mappings, not exact historical snapshots.",
-                  "All version rows for the same npm package share package-level GHSA targets.",
+                  "Historical GHSA inputs are version-specific; 90-day GHSA targets remain package-level.",
+                  "Unparseable or missing GHSA affected-version ranges cause the affected package to be skipped, not silently labeled zero.",
                   "Blank CSV cells represent NULL: unavailable optional data.",
               ]}
     cols = csv_columns()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     nrows = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def process_package(pkg):
+        LOG.info("Collecting %s", pkg)
+        try:
+            rows, metadata = build_package(http, pkg, cutoff, months, args.github_activity,
+                                           args.max_github_pages, args.max_advisory_pages)
+            return pkg, rows, metadata
+        except (requests.RequestException, ValueError, IncompletePagination, KeyError) as exc:
+            LOG.error("Skipping %s: required data could not be collected: %s", pkg, exc)
+            return pkg, [], {"status": "error", "message": str(exc)}
+
     with output.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="raise")
         writer.writeheader()
-        for pkg in packages:
-            LOG.info("Collecting %s", pkg)
-            try:
-                rows, metadata = build_package(http, pkg, cutoff, months, args.github_activity,
-                                               args.max_github_pages, args.max_advisory_pages)
-                for row in rows:
-                    writer.writerow(row) 
-                    nrows += 1
+        
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = {pool.submit(process_package, pkg): pkg for pkg in packages}
+            for future in as_completed(futures):
+                pkg, rows, metadata = future.result()
                 report["package_results"][pkg] = metadata
-            except (requests.RequestException, ValueError, IncompletePagination, KeyError) as exc:
-                LOG.error("Skipping %s: required data could not be collected: %s", pkg, exc)
-                report["package_results"][pkg] = {"status": "error", "message": str(exc)}
+                for row in rows:
+                    writer.writerow(row)
+                    nrows += 1
     report["rows_written"] = nrows
     Path(args.manifest).write_text(json.dumps(report, indent=2), encoding="utf-8")
     LOG.info("Wrote %d version rows with %d schema fields to %s", nrows, len(cols), output)
